@@ -82,6 +82,8 @@ def persist_response(output_dir: Path, query_id: str | None, query: str, result:
 
     termination = result.get("termination", "")
     status = "completed" if termination == "answer" else termination
+    prediction = result.get("prediction", "")
+    ground_truth_answer = result.get("answer", "")
 
     result_array = parse_messages_to_result_array(result.get("messages", []))
 
@@ -99,6 +101,10 @@ def persist_response(output_dir: Path, query_id: str | None, query: str, result:
             "infmem_model_server": args.infmem_model_server,
         },
         "query_id": query_id,
+        "question": query,
+        "ground_truth_answer": ground_truth_answer,
+        "prediction": prediction,
+        "termination": termination,
         "tool_call_counts": result.get("tool_call_counts", {}),
         "tool_call_counts_all": result.get("tool_call_counts_all", {}),
         "status": status,
