@@ -44,3 +44,32 @@ To evaluate the results:
 python scripts_evaluation/evaluate_run.py --input_dir runs/qwen3-8/tongyi --tensor_parallel_size 1
 ```
 > where you may replace `--tensor_parallel_size` with the number of GPUs you have to inference with Qwen3-32B, our primary judge model.
+
+## Tongyi With InfMem Search Summaries
+
+If you want Tongyi's local `search` tool to summarize long retrieved documents with InfMem instead of plain truncation, first launch the Tongyi answer model and the InfMem memory model separately:
+
+```bash
+vllm serve Alibaba-NLP/Tongyi-DeepResearch-30B-A3B --port 6008 --tensor-parallel-size {num_gpus}
+```
+
+```bash
+vllm serve /work/mingze/models/qwen4b_infmem_earlystop_stage2/global_step_150/huggingface --port 8001 --tensor-parallel-size {num_gpus_for_memory}
+```
+
+Then run the Tongyi client with `--long-doc-mode infmem`:
+
+```bash
+python search_agent/tongyi_client.py \
+  --output-dir runs/bm25/tongyi_infmem \
+  --searcher-type bm25 \
+  --index-path indexes/bm25 \
+  --port 6008 \
+  --long-doc-mode infmem \
+  --snippet-max-tokens 1024 \
+  --infmem-model /work/mingze/models/qwen4b_infmem_earlystop_stage2/global_step_150/huggingface \
+  --infmem-model-server http://127.0.0.1:8001/v1 \
+  --num-threads 10
+```
+
+This path does not require MCP. The Tongyi client still uses its in-process local search tool, but long documents are now rewritten into query-aware InfMem summaries before being returned to the model.

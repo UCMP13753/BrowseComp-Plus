@@ -15,6 +15,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from tongyi_utils.react_agent import MultiTurnReactAgent
 from tongyi_utils.tool_search import SearchToolHandler
+from searcher.infmem_adapter import InfMemConfig, InfMemSummarizer
 from searcher.searchers import SearcherType
 import re
 
@@ -92,7 +93,10 @@ def persist_response(output_dir: Path, query_id: str | None, query: str, result:
             "presence_penalty": args.presence_penalty,
             "snippet_max_tokens": args.snippet_max_tokens,
             "k": args.k,
-            "searcher_type": args.searcher_type
+            "searcher_type": args.searcher_type,
+            "long_doc_mode": args.long_doc_mode,
+            "infmem_model": args.infmem_model,
+            "infmem_model_server": args.infmem_model_server,
         },
         "query_id": query_id,
         "tool_call_counts": result.get("tool_call_counts", {}),
@@ -208,6 +212,35 @@ def main():
     # Server configuration arguments
     parser.add_argument("--snippet-max-tokens", type=int, default=512, help="Max tokens for search snippet truncation")
     parser.add_argument("--k", type=int, default=5, help="Number of search results to return")
+    parser.add_argument(
+        "--long-doc-mode",
+        choices=["truncate", "infmem"],
+        default="truncate",
+        help="How to handle documents longer than --snippet-max-tokens. 'truncate' returns the leading snippet, while 'infmem' returns a query-aware InfMem summary.",
+    )
+    parser.add_argument(
+        "--infmem-model",
+        type=str,
+        help="Judge/read model to use for InfMem long-document summarization. Required when --long-doc-mode=infmem.",
+    )
+    parser.add_argument(
+        "--infmem-model-server",
+        type=str,
+        default="http://127.0.0.1:8000/v1",
+        help="OpenAI-compatible model server URL used for InfMem summarization (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--infmem-timeout-seconds",
+        type=float,
+        default=120.0,
+        help="Timeout in seconds for each InfMem model request (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--infmem-max-recurrent-steps",
+        type=int,
+        default=4,
+        help="Maximum number of recurrent 5k-token document chunks InfMem may process per document (default: %(default)s).",
+    )
 
     parser.add_argument(
         "--searcher-type",
@@ -230,12 +263,51 @@ def main():
     
     os.makedirs(output_dir, exist_ok=True)
 
+    infmem_summarizer = None
+    if args.long_doc_mode == "infmem":
+        if args.snippet_max_tokens is None or args.snippet_max_tokens <= 0:
+            parser.error("--snippet-max-tokens must be positive when --long-doc-mode=infmem")
+        if not args.infmem_model:
+            parser.error("--infmem-model is required when --long-doc-mode=infmem")
+
+        infmem_summarizer = InfMemSummarizer(
+            InfMemConfig(
+                model=args.infmem_model,
+                model_server=args.infmem_model_server,
+                timeout_seconds=args.infmem_timeout_seconds,
+                max_summary_tokens=args.snippet_max_tokens,
+                recurrent_max_new=args.snippet_max_tokens,
+                max_recurrent_steps=args.infmem_max_recurrent_steps,
+                early_stop=1,
+                thinking_budget=1024,
+                enable_thinking=True,
+            ),
+            tokenizer=None,
+        )
+
     searcher = searcher_class(args)
     search_tool_handler = SearchToolHandler(
         searcher=searcher,
         snippet_max_tokens=args.snippet_max_tokens,
-        k=args.k
+        k=args.k,
+        long_doc_mode=args.long_doc_mode,
+        infmem_summarizer=infmem_summarizer,
     )
+
+    print(
+        f"Tongyi search tool started with {searcher.search_type} search "
+        f"(snippet_max_tokens={args.snippet_max_tokens}, k={args.k}, long_doc_mode={args.long_doc_mode})"
+    )
+    if args.long_doc_mode == "infmem":
+        print(
+            "InfMem configuration: "
+            f"model={args.infmem_model}, "
+            f"model_server={args.infmem_model_server}, "
+            f"timeout={args.infmem_timeout_seconds}s, "
+            f"memory_budget={args.snippet_max_tokens}, "
+            f"early_stop=1, "
+            f"max_recurrent_steps={args.infmem_max_recurrent_steps}"
+        )
 
     llm_cfg = {
         'model': model,

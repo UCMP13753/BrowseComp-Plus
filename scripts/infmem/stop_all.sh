@@ -34,7 +34,6 @@ stop_by_pid_file() {
 }
 
 stop_by_pid_file "infmem agent" "${repo_root}/pids/${AGENT_LAUNCH_NAME}.pid"
-stop_by_pid_file "infmem mcp" "${repo_root}/pids/${MCP_LAUNCH_NAME}.pid"
 stop_by_pid_file "infmem memory vllm" "${repo_root}/pids/${INFMEM_VLLM_LAUNCH_NAME}.pid"
 stop_by_pid_file "infmem answer vllm" "${repo_root}/pids/${ANSWER_VLLM_LAUNCH_NAME}.pid"
 stop_by_pid_file "infmem start_all" "${repo_root}/pids/${START_ALL_LAUNCH_NAME}.pid"

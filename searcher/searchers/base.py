@@ -60,7 +60,9 @@ class BaseSearcher(ABC):
         """
         return (
             f"Perform a search on a knowledge source. Returns top-{k} hits with docid, "
-            "score, and snippet. Provide a 'query' string, and optionally an "
+            "score, and snippet. Provide one 'query' string per call whenever possible. "
+            "A list of query strings is accepted only as a compatibility fallback and "
+            "will be expanded into multiple searches internally. You may also provide an "
             "'original_question' string when you want the server to summarize long "
             "documents with question-aware evidence instead of a leading snippet."
         )

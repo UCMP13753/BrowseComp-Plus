@@ -3,6 +3,7 @@
 # Modified to use only our local search tool to adhere to BrowseComp-Plus evaluation
 
 import json5
+import logging
 import os
 from typing import Dict, List, Optional, Union
 from qwen_agent.llm.schema import Message
@@ -46,6 +47,19 @@ MAX_LLM_CALL_PER_RUN = int(os.getenv('MAX_LLM_CALL_PER_RUN', 100))
 
 import random
 import datetime
+
+
+_BUILD_PROMPT_DEPRECATION = "Support for `build_text_completion_prompt` is deprecated."
+
+
+class _SuppressBuildPromptWarning(logging.Filter):
+    def filter(self, record):
+        return _BUILD_PROMPT_DEPRECATION not in record.getMessage()
+
+
+_qwen_logger = logging.getLogger("qwen_agent_logger")
+if not any(isinstance(f, _SuppressBuildPromptWarning) for f in _qwen_logger.filters):
+    _qwen_logger.addFilter(_SuppressBuildPromptWarning())
 
 
 def today_date():
@@ -122,7 +136,7 @@ class MultiTurnReactAgent(FnCallAgent):
         
         full_message = [Message(**x) for x in messages]
         full_prompt = build_text_completion_prompt(full_message, allow_special=True)
-        
+
         return len(tokenizer.encode(full_prompt))
 
     def _run(self, data: str, model: str, **kwargs) -> List[List[Message]]:
@@ -179,7 +193,11 @@ class MultiTurnReactAgent(FnCallAgent):
 
                     tool_call_counts_all[tool_name] = tool_call_counts_all.get(tool_name, 0) + 1
 
-                    result, docids = self.custom_call_tool(tool_name, tool_args)
+                    result, docids = self.custom_call_tool(
+                        tool_name,
+                        tool_args,
+                        original_question=question,
+                    )
 
                     if docids is not None:
                         tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + 1

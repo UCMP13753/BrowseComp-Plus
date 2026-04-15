@@ -21,6 +21,63 @@ from utils import extract_retrieved_docids_from_result
 load_dotenv()
 
 
+class RobustAssistant(Assistant):
+    def _resolve_tool_name(self, tool_name: str) -> str:
+        if tool_name in self.function_map:
+            return tool_name
+
+        alias_candidates = [
+            registered_name
+            for registered_name in self.function_map
+            if registered_name.endswith(f"-{tool_name}")
+        ]
+        if len(alias_candidates) == 1:
+            return alias_candidates[0]
+
+        return tool_name
+
+    def _normalize_tool_args(self, tool_name: str, tool_args):
+        params = tool_args
+        was_json_string = isinstance(tool_args, str)
+
+        if was_json_string:
+            try:
+                params = json.loads(tool_args)
+            except Exception:
+                return tool_args
+
+        if not isinstance(params, dict):
+            return tool_args
+
+        if tool_name.endswith("-search") or tool_name == "search":
+            query = params.get("query")
+            if isinstance(query, list):
+                normalized_queries = [
+                    item.strip()
+                    for item in query
+                    if isinstance(item, str) and item.strip()
+                ]
+                if len(normalized_queries) == 1:
+                    params["query"] = normalized_queries[0]
+                elif normalized_queries:
+                    params["query"] = normalized_queries
+
+        if was_json_string:
+            return json.dumps(params, ensure_ascii=False)
+        return params
+
+    def _call_tool(self, tool_name: str, tool_args="{}", **kwargs):
+        resolved_tool_name = self._resolve_tool_name(tool_name)
+        normalized_tool_args = self._normalize_tool_args(
+            resolved_tool_name, tool_args
+        )
+        return super()._call_tool(
+            resolved_tool_name,
+            normalized_tool_args,
+            **kwargs,
+        )
+
+
 def init_qwen_agent(
     model: str, model_server: str, mcp_url: str, max_tokens: int = 1000
 ):
@@ -42,7 +99,7 @@ def init_qwen_agent(
 
     tools = [{"mcpServers": {"search-server": {"url": mcp_url}}}]
 
-    bot = Assistant(llm=llm_cfg, function_list=tools)
+    bot = RobustAssistant(llm=llm_cfg, function_list=tools)
 
     return bot
 

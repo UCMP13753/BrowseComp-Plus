@@ -47,17 +47,10 @@ else
   wait_for_port "${VLLM_HOST}" "${VLLM_PORT}" "truncate answer vLLM"
 fi
 
-if port_is_open "${MCP_HOST}" "${MCP_PORT}"; then
-  echo "MCP server already detected on ${MCP_HOST}:${MCP_PORT}, skipping launch."
-else
-  echo "Launching truncate MCP server ..."
-  bash "${repo_root}/scripts/mcp_serve.sh"
-  wait_for_port "${MCP_HOST}" "${MCP_PORT}" "truncate MCP server"
-fi
-
-echo "Launching truncate agent run ..."
-bash "${repo_root}/scripts/test_launcher.sh"
+echo "Launching truncate Tongyi run ..."
+bash "${repo_root}/scripts/tongyi_launcher.sh"
 
 echo "Truncate launch steps completed."
+echo "Tongyi planning port: ${TONGYI_PORT}"
 echo "Agent log: ${AGENT_LOG_PATH}"
 echo "Tail agent log: tail -f ${AGENT_LOG_PATH}"

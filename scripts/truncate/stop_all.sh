@@ -34,6 +34,5 @@ stop_by_pid_file() {
 }
 
 stop_by_pid_file "truncate agent" "${repo_root}/pids/${AGENT_LAUNCH_NAME}.pid"
-stop_by_pid_file "truncate mcp" "${repo_root}/pids/${MCP_LAUNCH_NAME}.pid"
 stop_by_pid_file "truncate vllm" "${repo_root}/pids/${VLLM_LAUNCH_NAME}.pid"
 stop_by_pid_file "truncate start_all" "${repo_root}/pids/${START_ALL_LAUNCH_NAME}.pid"

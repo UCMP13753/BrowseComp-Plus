@@ -11,6 +11,24 @@ from transformers import AutoTokenizer
 logger = logging.getLogger(__name__)
 
 
+def _normalize_queries(query: str | List[str]) -> List[str]:
+    if isinstance(query, str):
+        cleaned = query.strip()
+        return [cleaned] if cleaned else []
+
+    if not isinstance(query, list):
+        return []
+
+    normalized = []
+    for item in query:
+        if not isinstance(item, str):
+            continue
+        cleaned = item.strip()
+        if cleaned:
+            normalized.append(cleaned)
+    return normalized
+
+
 def register_tools(
     mcp: FastMCP,
     searcher: BaseSearcher,
@@ -48,18 +66,53 @@ def register_tools(
         description=searcher.search_description(k),
     )
     def search(
-        query: str,
+        query: str | List[str],
         original_question: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search the index and return top-k hits
         Args:
-            query: Search query string
+            query: Search query string, or a compatibility fallback list of strings
             original_question: Optional original user question for query-aware long-document summarization.
         Returns:
             List of search results with docid, score, text
         """
-        candidates = searcher.search(query, k)
+        normalized_queries = _normalize_queries(query)
+        if not normalized_queries:
+            raise ValueError("query must be a non-empty string or list of strings")
+
+        if len(normalized_queries) > 1:
+            logger.info(
+                "Received %d queries in a single search call; expanding them sequentially",
+                len(normalized_queries),
+            )
+
+        merged_candidates: List[Dict[str, Any]] = []
+        merged_by_docid: Dict[str, Dict[str, Any]] = {}
+        for single_query in normalized_queries:
+            for candidate in searcher.search(single_query, k):
+                docid = str(candidate["docid"])
+                existing = merged_by_docid.get(docid)
+                if existing is None:
+                    copied = dict(candidate)
+                    merged_by_docid[docid] = copied
+                    merged_candidates.append(copied)
+                    continue
+
+                previous_score = existing.get("score")
+                new_score = candidate.get("score")
+                if new_score is not None and (
+                    previous_score is None or new_score > previous_score
+                ):
+                    existing.update(candidate)
+
+        if merged_candidates and all(
+            candidate.get("score") is not None for candidate in merged_candidates
+        ):
+            merged_candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
+
+        candidates = merged_candidates[:k]
+        summary_query = normalized_queries[0]
 
         for cand in candidates:
             text = cand["text"]
@@ -73,7 +126,7 @@ def register_tools(
                 and doc_token_count > snippet_max_tokens
             )
             if should_use_infmem:
-                question = (original_question or query).strip() or query
+                question = (original_question or summary_query).strip() or summary_query
                 try:
                     cand["snippet"] = infmem_summarizer.summarize_document(
                         docid=str(cand["docid"]),
