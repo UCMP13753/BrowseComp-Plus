@@ -10,6 +10,7 @@ if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
 from dotenv import load_dotenv
+from infmem_adapter import InfMemConfig, InfMemSummarizer
 from searchers import SearcherType
 from tools import register_tools
 
@@ -36,14 +37,43 @@ def main():
         parser.add_argument(
             "--snippet-max-tokens",
             type=int,
-            default=512,
-            help="Number of tokens to include for each document snippet in search results using Qwen/Qwen3-0.6B tokenizer (default: 512). Set to -1 to disable.",
+            default=1024,
+            help="Number of tokens to include for each document snippet in search results using Qwen/Qwen3-0.6B tokenizer (default: 1024). This is also the InfMem activation threshold and output budget. Set to -1 to disable.",
         )
         parser.add_argument(
             "--k",
             type=int,
             default=5,
             help="Fixed number of search results to return for all queries in this session (default: 5).",
+        )
+        parser.add_argument(
+            "--long-doc-mode",
+            choices=["truncate", "infmem"],
+            default="truncate",
+            help="How to handle documents longer than --snippet-max-tokens. 'truncate' returns the leading snippet, while 'infmem' returns a query-aware InfMem summary (default: truncate).",
+        )
+        parser.add_argument(
+            "--infmem-model",
+            type=str,
+            help="Judge/read model to use for InfMem long-document summarization. Required when --long-doc-mode=infmem.",
+        )
+        parser.add_argument(
+            "--infmem-model-server",
+            type=str,
+            default="http://127.0.0.1:8000/v1",
+            help="OpenAI-compatible model server URL used for InfMem summarization (default: %(default)s).",
+        )
+        parser.add_argument(
+            "--infmem-timeout-seconds",
+            type=float,
+            default=120.0,
+            help="Timeout in seconds for each InfMem model request (default: %(default)s).",
+        )
+        parser.add_argument(
+            "--infmem-max-recurrent-steps",
+            type=int,
+            default=4,
+            help="Maximum number of recurrent 5k-token document chunks InfMem may process per document (default: %(default)s).",
         )
         parser.add_argument(
             "--get-document",
@@ -101,14 +131,49 @@ def main():
 
         snippet_max_tokens = args.snippet_max_tokens
         k = args.k
+        long_doc_mode = args.long_doc_mode
         include_get_document = args.get_document
         transport = args.transport
         port = args.port
         public = args.public
 
+        infmem_summarizer = None
+        if long_doc_mode == "infmem":
+            if snippet_max_tokens is None or snippet_max_tokens <= 0:
+                raise ValueError(
+                    "--snippet-max-tokens must be positive when --long-doc-mode=infmem"
+                )
+            if not args.infmem_model:
+                raise ValueError(
+                    "--infmem-model is required when --long-doc-mode=infmem"
+                )
+
+            infmem_summarizer = InfMemSummarizer(
+                InfMemConfig(
+                    model=args.infmem_model,
+                    model_server=args.infmem_model_server,
+                    timeout_seconds=args.infmem_timeout_seconds,
+                    max_summary_tokens=snippet_max_tokens,
+                    recurrent_max_new=snippet_max_tokens,
+                    max_recurrent_steps=args.infmem_max_recurrent_steps,
+                    early_stop=1,
+                    thinking_budget=1024,
+                    enable_thinking=True,
+                ),
+                tokenizer=None,
+            )
+
         mcp = FastMCP(name="search-server")
 
-        register_tools(mcp, searcher, snippet_max_tokens, k, include_get_document)
+        register_tools(
+            mcp,
+            searcher,
+            snippet_max_tokens,
+            k,
+            include_get_document,
+            long_doc_mode=long_doc_mode,
+            infmem_summarizer=infmem_summarizer,
+        )
 
         tools_registered = ["search"]
         if include_get_document:
@@ -116,9 +181,13 @@ def main():
         tools_str = ", ".join(tools_registered)
 
         print(
-            f"MCP server started with {searcher.search_type} search (snippet_max_tokens={snippet_max_tokens}, k={k}) using transport {transport.upper()}"
+            f"MCP server started with {searcher.search_type} search (snippet_max_tokens={snippet_max_tokens}, k={k}, long_doc_mode={long_doc_mode}) using transport {transport.upper()}"
         )
         print(f"Registered tools: {tools_str}")
+        if long_doc_mode == "infmem":
+            print(
+                f"InfMem configuration: model={args.infmem_model}, model_server={args.infmem_model_server}, timeout={args.infmem_timeout_seconds}s, thinking_budget=1024, memory_budget={snippet_max_tokens}, early_stop=1, max_recurrent_steps={args.infmem_max_recurrent_steps}"
+            )
 
         if public:
             try:

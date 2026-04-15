@@ -58,7 +58,12 @@ class BaseSearcher(ABC):
         """
         Description of the search tool to be passed to the LLM.
         """
-        return f"Perform a search on a knowledge source. Returns top-{k} hits with docid, score, and snippet. The snippet contains the document's contents (may be truncated based on token limits)."
+        return (
+            f"Perform a search on a knowledge source. Returns top-{k} hits with docid, "
+            "score, and snippet. Provide a 'query' string, and optionally an "
+            "'original_question' string when you want the server to summarize long "
+            "documents with question-aware evidence instead of a leading snippet."
+        )
 
     def get_document_description(self) -> str:
         """
