@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from tongyi_utils.react_agent import MultiTurnReactAgent
-from tongyi_utils.tool_search import SearchToolHandler
+from tongyi_utils.tool_search import SearchToolHandler, VisitToolHandler
 from searcher.infmem_adapter import InfMemConfig, InfMemSummarizer
 from searcher.searchers import SearcherType
 import re
@@ -96,6 +96,7 @@ def persist_response(output_dir: Path, query_id: str | None, query: str, result:
             "snippet_max_tokens": args.snippet_max_tokens,
             "k": args.k,
             "searcher_type": args.searcher_type,
+            "toolset": args.toolset,
             "long_doc_mode": args.long_doc_mode,
             "infmem_model": args.infmem_model,
             "infmem_model_server": args.infmem_model_server,
@@ -214,6 +215,12 @@ def main():
     parser.add_argument("--num-threads", type=int, default=10, help="Number of parallel threads for processing queries")
     parser.add_argument("--port", type=int, default=6008, help="LLM server port")
     parser.add_argument("--store-raw", action="store_true", help="Store raw messages in the output JSON")
+    parser.add_argument(
+        "--toolset",
+        choices=["standard", "custom"],
+        default="standard",
+        help="Tongyi native toolset to expose. 'standard' enables only search; 'custom' enables search plus visit.",
+    )
 
     # Server configuration arguments
     parser.add_argument("--snippet-max-tokens", type=int, default=512, help="Max tokens for search snippet truncation")
@@ -292,6 +299,7 @@ def main():
         )
 
     searcher = searcher_class(args)
+    include_visit = args.toolset == "custom"
     search_tool_handler = SearchToolHandler(
         searcher=searcher,
         snippet_max_tokens=args.snippet_max_tokens,
@@ -299,11 +307,16 @@ def main():
         long_doc_mode=args.long_doc_mode,
         infmem_summarizer=infmem_summarizer,
     )
+    visit_tool_handler = VisitToolHandler(searcher=searcher) if include_visit else None
+    tool_names = ["search"]
+    if include_visit:
+        tool_names.append("visit")
 
     print(
         f"Tongyi search tool started with {searcher.search_type} search "
-        f"(snippet_max_tokens={args.snippet_max_tokens}, k={args.k}, long_doc_mode={args.long_doc_mode})"
+        f"(snippet_max_tokens={args.snippet_max_tokens}, k={args.k}, long_doc_mode={args.long_doc_mode}, toolset={args.toolset})"
     )
+    print(f"Registered tools: {', '.join(tool_names)}")
     if args.long_doc_mode == "infmem":
         print(
             "InfMem configuration: "
@@ -329,8 +342,9 @@ def main():
 
     agent = MultiTurnReactAgent(
         llm=llm_cfg,
-        function_list=["search"],
-        search_tool_handler=search_tool_handler
+        function_list=tool_names,
+        search_tool_handler=search_tool_handler,
+        visit_tool_handler=visit_tool_handler,
     )
     
     query_str = args.query.strip()

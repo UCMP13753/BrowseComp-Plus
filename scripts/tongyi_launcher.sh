@@ -16,6 +16,7 @@ num_threads="${TONGYI_NUM_THREADS}"
 temperature="${TONGYI_TEMPERATURE}"
 top_p="${TONGYI_TOP_P}"
 presence_penalty="${TONGYI_PRESENCE_PENALTY}"
+toolset="${TONGYI_TOOLSET:-standard}"
 model_name="${MCP_MODEL_NAME:-}"
 normalize="${MCP_NORMALIZE:-0}"
 
@@ -34,6 +35,7 @@ cmd=(
   --temperature "${temperature}"
   --top_p "${top_p}"
   --presence_penalty "${presence_penalty}"
+  --toolset "${toolset}"
 )
 
 if [[ -n "${QUERY_FILE:-}" ]]; then

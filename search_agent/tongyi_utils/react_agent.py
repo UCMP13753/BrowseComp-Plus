@@ -1,7 +1,8 @@
 # Code is mostly based on the original Alibaba-NLP/DeepResearch inference script
 # in https://github.com/Alibaba-NLP/DeepResearch
-# Modified to use only our local search tool to adhere to BrowseComp-Plus evaluation
+# Modified to use local BrowseComp-Plus tools to adhere to evaluation settings
 
+import json
 import json5
 import logging
 import os
@@ -19,25 +20,95 @@ from qwen_agent.settings import MAX_LLM_CALL_PER_RUN
 from qwen_agent.tools import BaseTool
 import time
 
-SYSTEM_PROMPT_SEARCH_ONLY = """You are a deep research assistant. Your core function is to conduct thorough, multi-source investigations into any topic. You must handle both broad, open-domain inquiries and queries within specialized academic fields. For every request, synthesize information from credible, diverse sources to deliver a comprehensive, accurate, and objective response. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <answer></answer> tags.
+from tongyi_utils.tool_search import SearchToolHandler, VisitToolHandler
+
+
+def _build_tool_schema(tool_name: str) -> dict:
+    if tool_name == "search":
+        return {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": (
+                    "Search the local BrowseComp-Plus corpus and return the top "
+                    "matching results with docids and snippets. Accepts a single query."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query.",
+                        }
+                    },
+                    "required": ["query"],
+                },
+            },
+        }
+
+    if tool_name == "visit":
+        return {
+            "type": "function",
+            "function": {
+                "name": "visit",
+                "description": (
+                    "Retrieve the full text of a specific local document by docid. "
+                    "This local visit tool only accepts an exact docid returned by a "
+                    "previous search call, not a URL. It is often useful for checking "
+                    "one or two promising search results whose snippets may be partial."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "docid": {
+                            "type": "string",
+                            "description": (
+                                "An exact docid returned by a previous search call. "
+                                "Do not pass a URL, title, rank, or snippet."
+                            ),
+                        }
+                    },
+                    "required": ["docid"],
+                },
+            },
+        }
+
+    raise ValueError(f"Unsupported tool name: {tool_name}")
+
+
+def build_system_prompt(tool_names: List[str]) -> str:
+    tool_schemas = [_build_tool_schema(tool_name) for tool_name in tool_names]
+
+    if tool_names == ["search"]:
+        tool_usage = "You may call the search tool one or multiple times to assist with the user query."
+    else:
+        tool_usage = (
+            "You may call the search and visit tools one or multiple times. "
+            "Use search to discover relevant docids, then use visit when you "
+            "need the full contents of a promising document. After search, it is "
+            "often helpful to visit one or two promising results before answering, "
+            "especially when a snippet looks relevant but partial or you need exact "
+            "wording. The local visit tool accepts docid only, not URL. When "
+            "calling visit, you must copy one exact docid returned by search."
+        )
+
+    return f"""You are a deep research assistant. Your core function is to conduct thorough, multi-source investigations into any topic. You must handle both broad, open-domain inquiries and queries within specialized academic fields. For every request, synthesize information from credible, diverse sources to deliver a comprehensive, accurate, and objective response. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <answer></answer> tags.
 
 # Tools
 
-You may call the search tool one or multiple times to assist with the user query.
+{tool_usage}
 
-You are provided with the search tool, its signature within <tools></tools> XML tags:
+You are provided with the available tools, with their signatures within <tools></tools> XML tags:
 <tools>
-{"type": "function", "function": {"name": "search", "description": "Perform Google web searches then returns a string of the top search results. Accepts a single query.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "The search query."}}, "required": ["query"]}}}
+{json.dumps(tool_schemas, ensure_ascii=False)}
 </tools>
 
-For each search tool call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+For each tool call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
 <tool_call>
-{"name": search, "arguments": <args-json-object>}
+{{"name": "tool name here", "arguments": <args-json-object>}}
 </tool_call>
 
 Current date: """
-
-from tongyi_utils.tool_search import SearchToolHandler
 
 OBS_START = '<tool_response>'
 OBS_END = '\n</tool_response>'
@@ -70,11 +141,24 @@ class MultiTurnReactAgent(FnCallAgent):
                  function_list: Optional[List[Union[str, Dict, BaseTool]]] = None,
                  llm: Optional[Union[Dict, BaseChatModel]] = None,
                  search_tool_handler: Optional[SearchToolHandler] = None,
+                 visit_tool_handler: Optional[VisitToolHandler] = None,
                  **kwargs):
 
         self.llm_generate_cfg = llm["generate_cfg"]
         self.llm_local_path = llm["model"]
-        self.search_tool = search_tool_handler
+        self.tool_handlers = {}
+        if search_tool_handler is not None:
+            self.tool_handlers["search"] = search_tool_handler
+        if visit_tool_handler is not None:
+            self.tool_handlers["visit"] = visit_tool_handler
+
+        self.tool_names = [
+            tool_name
+            for tool_name in (function_list or list(self.tool_handlers))
+            if isinstance(tool_name, str) and tool_name in self.tool_handlers
+        ]
+        if not self.tool_names:
+            self.tool_names = list(self.tool_handlers)
 
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
@@ -155,7 +239,7 @@ class MultiTurnReactAgent(FnCallAgent):
         planning_port = data['planning_port']
         answer = data['item']['answer']
         self.user_prompt = question
-        system_prompt = SYSTEM_PROMPT_SEARCH_ONLY
+        system_prompt = build_system_prompt(self.tool_names)
         cur_date = today_date()
         system_prompt = system_prompt + str(cur_date)
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
@@ -263,7 +347,7 @@ class MultiTurnReactAgent(FnCallAgent):
         return result
 
     def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
-        if tool_name == "search" and self.search_tool:
-            return self.search_tool.call(tool_args, **kwargs)
-        else:
+        handler = self.tool_handlers.get(tool_name)
+        if handler is None:
             return f"Error: Tool {tool_name} not found", None
+        return handler.call(tool_args, **kwargs)

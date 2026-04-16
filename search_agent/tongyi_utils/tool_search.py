@@ -1,3 +1,4 @@
+import json
 import logging
 import sys
 from typing import List, Union
@@ -31,7 +32,11 @@ class SearchToolHandler(BaseTool):
         self.long_doc_mode = long_doc_mode
         self.infmem_summarizer = infmem_summarizer
 
-        self.description = f"Performs a search on a knowledge source: supply a single 'query' string; the tool retrieves the top {self.k} most relevant results."
+        self.description = (
+            f"Search the local BrowseComp-Plus corpus using one 'query' string and "
+            f"return the top {self.k} matching results. Each result is only a preview "
+            "snippet, not the full document."
+        )
 
         self.tokenizer = None
         if snippet_max_tokens and snippet_max_tokens > 0:
@@ -59,6 +64,7 @@ class SearchToolHandler(BaseTool):
         for idx, r in enumerate(results, 1):
             passage_text = r["text"]
             title = ""
+            docid = str(r.get("docid", ""))
 
             if passage_text.startswith("---\ntitle:"):
                 lines = passage_text.split("\n")
@@ -72,9 +78,7 @@ class SearchToolHandler(BaseTool):
             snippet = r.get("snippet")
             if snippet is None:
                 snippet, _ = self._truncate_with_count(passage_text, max_tokens)
-
-            # Follows original tongyi search tool format
-            formatted_result = f"{idx}. [{title}]\n{snippet}"
+            formatted_result = f"{idx}. [{title}] (docid: {docid})\n{snippet}"
             formatted.append(formatted_result)
 
         return formatted
@@ -103,6 +107,16 @@ class SearchToolHandler(BaseTool):
                 passage_text = result["text"]
                 snippet, doc_token_count = self._truncate_with_count(
                     passage_text, self.snippet_max_tokens
+                )
+                result["doc_token_count"] = doc_token_count
+                result["snippet_truncated"] = (
+                    doc_token_count > self.snippet_max_tokens
+                    if (
+                        self.snippet_max_tokens is not None
+                        and self.snippet_max_tokens > 0
+                        and doc_token_count >= 0
+                    )
+                    else False
                 )
 
                 should_use_infmem = (
@@ -138,7 +152,13 @@ class SearchToolHandler(BaseTool):
 
             formatted_results = self._format_results(results, self.snippet_max_tokens)
 
-            content = f"A search for '{query}' found {len(formatted_results)} results:\n\n## Web Results\n" + "\n\n".join(formatted_results)
+            content = (
+                f"A search for '{query}' found {len(formatted_results)} results. "
+                "Each result includes a docid. If a result looks promising but the "
+                "snippet may be incomplete, visiting one or two of the exact docids "
+                "shown below is often useful before answering.\n\n## Corpus Results\n"
+                + "\n\n".join(formatted_results)
+            )
             return content, docids
 
         except Exception as e:
@@ -161,3 +181,48 @@ class SearchToolHandler(BaseTool):
             original_question=kwargs.get("original_question"),
         )
         return response, docids
+
+
+@register_tool("visit", allow_overwrite=True)
+class VisitToolHandler(BaseTool):
+    name = "visit"
+
+    def __init__(self, searcher):
+        super().__init__()
+
+        self.searcher = searcher
+        self.description = (
+            "Retrieve the full contents of one promising document by supplying its "
+            "exact 'docid' from a previous search result. This local visit tool only "
+            "accepts docid, not URL. Use this after search when a preview snippet "
+            "looks relevant, incomplete, or you need exact wording; checking one or "
+            "two promising results is often worthwhile. Do not pass a URL, title, "
+            "rank, or snippet text."
+        )
+
+    def call(self, params: Union[str, dict], **kwargs):
+        try:
+            docid = params["docid"]
+        except Exception:
+            return (
+                "[Visit] Invalid request format: Input must be a JSON object "
+                "containing 'docid' field",
+                None,
+            )
+
+        if not isinstance(docid, str):
+            return "[Visit] Invalid request format: 'docid' must be a string", None
+
+        docid = docid.strip()
+        if not docid:
+            return "[Visit] Invalid request format: 'docid' must be non-empty", None
+
+        try:
+            result = self.searcher.get_document(docid)
+        except Exception as exc:
+            return f"[Visit] Error retrieving docid '{docid}': {exc}", None
+
+        if result is None:
+            return f"[Visit] Document with docid '{docid}' not found.", None
+
+        return json.dumps(result, ensure_ascii=False, indent=2), [docid]
