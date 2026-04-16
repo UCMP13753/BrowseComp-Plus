@@ -19,6 +19,17 @@ cmd=(
   --k "${MCP_K}"
 )
 
+if [[ "${MCP_SEARCHER_TYPE}" == "faiss" ]]; then
+  if [[ -z "${MCP_MODEL_NAME:-}" ]]; then
+    echo "MCP_MODEL_NAME must be set when MCP_SEARCHER_TYPE=faiss" >&2
+    exit 1
+  fi
+  cmd+=(--model-name "${MCP_MODEL_NAME}")
+  if [[ "${MCP_NORMALIZE:-0}" == "1" ]]; then
+    cmd+=(--normalize)
+  fi
+fi
+
 if [[ "${MCP_LONG_DOC_MODE}" == "infmem" ]]; then
   cmd+=(
     --long-doc-mode infmem

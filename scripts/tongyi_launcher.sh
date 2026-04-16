@@ -16,6 +16,8 @@ num_threads="${TONGYI_NUM_THREADS}"
 temperature="${TONGYI_TEMPERATURE}"
 top_p="${TONGYI_TOP_P}"
 presence_penalty="${TONGYI_PRESENCE_PENALTY}"
+model_name="${MCP_MODEL_NAME:-}"
+normalize="${MCP_NORMALIZE:-0}"
 
 cmd=(
   "${PYTHON_BIN}"
@@ -36,6 +38,17 @@ cmd=(
 
 if [[ -n "${QUERY_FILE:-}" ]]; then
   cmd+=(--query "${QUERY_FILE}")
+fi
+
+if [[ "${searcher_type}" == "faiss" ]]; then
+  if [[ -z "${model_name}" ]]; then
+    echo "MCP_MODEL_NAME must be set when MCP_SEARCHER_TYPE=faiss" >&2
+    exit 1
+  fi
+  cmd+=(--model-name "${model_name}")
+  if [[ "${normalize}" == "1" ]]; then
+    cmd+=(--normalize)
+  fi
 fi
 
 if [[ "${TONGYI_STORE_RAW}" == "1" ]]; then
