@@ -8,6 +8,7 @@ tmp/
 retrieval/
 data/browsecomp_plus_decrypted.jsonl
 topics-qrels/queries.tsv
+topics-qrels/subsets/
 runs/
 evals/
 logs/
