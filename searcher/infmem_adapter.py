@@ -4,7 +4,7 @@ import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Any, Dict, List, Sequence
 
 from openai import OpenAI
 from qwen_agent.llm.fncall_prompts.qwen_fncall_prompt import QwenFnCallPrompt
@@ -102,7 +102,7 @@ FN_ARGS = "✿ARGS✿"
 FN_RESULT = "✿RESULT✿"
 FN_EXIT = "✿RETURN✿"
 
-BM25_MAX_PER_RECURRENT = 2
+BM25_MAX_PER_RECURRENT = 5
 BM25_DEDUP_JACCARD = 0.8
 BM25_CAND_MULTIPLIER = 6
 
@@ -184,6 +184,53 @@ def _build_retrieve_corpus_enhanced(
     return retrieve_docs, retrieve_meta
 
 
+def _build_retrieve_corpus_from_texts(
+    texts: Sequence[str],
+    tokenizer,
+    retrieve_chunk_size: int,
+    retrieve_chunk_overlap: int,
+) -> tuple[List[str], List[dict]]:
+    recurrent_chunks = []
+    input_ids_by_text = []
+    for idx, text in enumerate(texts):
+        token_ids = tokenizer.encode(text or "", add_special_tokens=False)
+        if not token_ids:
+            continue
+        input_ids_by_text.append((idx, token_ids))
+        recurrent_chunks.append(
+            {
+                "r_idx": idx,
+                "start": 0,
+                "end": len(token_ids),
+            }
+        )
+
+    retrieve_docs = []
+    retrieve_meta = []
+    overlap = min(retrieve_chunk_overlap, retrieve_chunk_size - 1)
+    step = max(1, retrieve_chunk_size - overlap)
+
+    for chunk_info, (_, token_ids) in zip(recurrent_chunks, input_ids_by_text):
+        pos = chunk_info["start"]
+        end = chunk_info["end"]
+        while pos < end:
+            rs = pos
+            re_idx = min(end, rs + retrieve_chunk_size)
+            retrieve_docs.append(tokenizer.decode(token_ids[rs:re_idx], skip_special_tokens=True))
+            retrieve_meta.append(
+                {
+                    "recurrent_idx": chunk_info["r_idx"],
+                    "start": rs,
+                    "end": re_idx,
+                }
+            )
+            if re_idx >= end:
+                break
+            pos = min(end, rs + step)
+
+    return retrieve_docs, retrieve_meta
+
+
 def _bm25_retrieve_for_recurrent_chunk_enhanced(
     query: str,
     bm25_model: BM25Okapi,
@@ -192,10 +239,15 @@ def _bm25_retrieve_for_recurrent_chunk_enhanced(
     retrieve_doc_tokens: Sequence[Sequence[str]],
     top_k: int,
     exclude_recurrent_idx: int | None = None,
+    exclude_recurrent_indices: Sequence[int] | None = None,
 ) -> List[str]:
     q_tokens = _tokenize_mixed(query)
     if not q_tokens:
         return []
+
+    excluded_indices = set(exclude_recurrent_indices or [])
+    if exclude_recurrent_idx is not None:
+        excluded_indices.add(exclude_recurrent_idx)
 
     scores = bm25_model.get_scores(q_tokens)
     if len(scores) == 0:
@@ -212,8 +264,7 @@ def _bm25_retrieve_for_recurrent_chunk_enhanced(
 
     for idx in candidate_idx:
         if (
-            exclude_recurrent_idx is not None
-            and retrieve_meta[idx]["recurrent_idx"] == exclude_recurrent_idx
+            retrieve_meta[idx]["recurrent_idx"] in excluded_indices
         ):
             continue
 
@@ -240,8 +291,7 @@ def _bm25_retrieve_for_recurrent_chunk_enhanced(
     ranked = scores.argsort()[::-1]
     for idx in ranked:
         if (
-            exclude_recurrent_idx is not None
-            and retrieve_meta[idx]["recurrent_idx"] == exclude_recurrent_idx
+            retrieve_meta[idx]["recurrent_idx"] in excluded_indices
         ):
             continue
         text = retrieve_docs[idx]
@@ -451,14 +501,14 @@ class InfMemConfig:
     model_server: str
     timeout_seconds: float = 120.0
     max_summary_tokens: int = 1024
-    recurrent_chunk_size: int = 5000
+    recurrent_chunk_size: int = 2000
     recurrent_max_new: int = 1024
     recurrent_max_context_len: int = 120000
     max_recurrent_steps: int = 4
-    retrieve_chunk_size: int = 500
+    retrieve_chunk_size: int = 200
     retrieve_chunk_overlap: int = 100
     default_top_k: int = 8
-    early_stop: int = 1
+    early_stop: int = 2
     enable_thinking: bool = True
     thinking_budget: int = 1024
     temperature: float = 0.7
@@ -509,6 +559,120 @@ class InfMemSummarizer:
 
         self._cache[cache_key] = summary
         return summary
+
+    def update_memory_with_context_pool(
+        self,
+        *,
+        question: str,
+        previous_memory: str,
+        current_chunk: str,
+        context_pool_texts: Sequence[str],
+        exclude_pool_indices: Sequence[int] | None = None,
+    ) -> tuple[str, Dict[str, Any]]:
+        if self.tokenizer is None:
+            raise ValueError("InfMemSummarizer requires a tokenizer before use")
+
+        memory = (previous_memory or "").strip() or NO_MEMORY
+        current_chunk = (current_chunk or "").strip()
+        pool_texts = [text for text in context_pool_texts if isinstance(text, str) and text.strip()]
+        retrieval_history: List[Dict[str, Any]] = []
+        retrieved_results: List[str] = []
+
+        if pool_texts:
+            retrieve_docs, retrieve_meta = _build_retrieve_corpus_from_texts(
+                texts=pool_texts,
+                tokenizer=self.tokenizer,
+                retrieve_chunk_size=self.config.retrieve_chunk_size,
+                retrieve_chunk_overlap=self.config.retrieve_chunk_overlap,
+            )
+            retrieve_doc_tokens = [_tokenize_mixed(doc) for doc in retrieve_docs]
+
+            if retrieve_doc_tokens:
+                bm25 = BM25Okapi(retrieve_doc_tokens)
+                planner_prompt = TEMPLATE_CALL_OR_ANSWER.format(
+                    prompt=question,
+                    memory=memory,
+                    retrieval_history="Single-step hidden-pool retrieval for the latest tool result.",
+                )
+                planner_text = _process_messages_to_text(
+                    self.tokenizer,
+                    [{"role": "user", "content": planner_prompt}],
+                    functions=[_get_bm25search_tool_schema()["function"]],
+                    enable_thinking=self.config.enable_thinking,
+                )
+                planner_raw = self._call_llm_text(
+                    planner_text,
+                    max_len=self.config.recurrent_max_new,
+                )
+                parsed_messages, _ = _parse_response(planner_raw)
+                tool_calls = [
+                    msg for msg in parsed_messages if isinstance(msg.get("function_call"), dict)
+                ]
+
+                for msg in tool_calls:
+                    function_call = msg["function_call"]
+                    if function_call["name"] != "retrievesearch":
+                        continue
+                    try:
+                        args = json.loads(function_call["arguments"])
+                    except Exception:
+                        args = {}
+
+                    query = _normalize_query(args.get("query", question), question)
+                    top_k = _clamp_top_k(args.get("top_k", self.config.default_top_k))
+                    retrieval_history.append({"query": query, "top_k": top_k})
+                    retrieved_results = _bm25_retrieve_for_recurrent_chunk_enhanced(
+                        query=query,
+                        bm25_model=bm25,
+                        retrieve_docs=retrieve_docs,
+                        retrieve_meta=retrieve_meta,
+                        retrieve_doc_tokens=retrieve_doc_tokens,
+                        top_k=top_k,
+                        exclude_recurrent_indices=exclude_pool_indices,
+                    )
+                    if retrieved_results:
+                        break
+
+        retrieved_block = "\n\n".join(
+            f"[Retrieved #{idx + 1}] {text}"
+            for idx, text in enumerate(retrieved_results)
+        )
+        memory_prompt = TEMPLATE_RETREIVE_RECURRENT.format(
+            prompt=question,
+            retrieve=retrieved_block,
+            chunk=current_chunk,
+            memory=memory,
+        )
+        memory_text = _process_messages_to_text(
+            self.tokenizer,
+            [{"role": "user", "content": memory_prompt}],
+            functions=None,
+            enable_thinking=self.config.enable_thinking,
+        )
+        memory_raw = self._call_llm_text(
+            memory_text,
+            max_len=self.config.recurrent_max_new,
+        )
+        updated_memory = _extract_solution(memory_raw) or memory
+        updated_memory = self._compress_memory_if_needed(
+            question=question,
+            memory=updated_memory,
+        )
+        updated_memory = self._clip_to_token_budget(
+            updated_memory,
+            self.config.max_summary_tokens,
+        )
+        if not updated_memory.strip():
+            updated_memory = memory
+
+        return updated_memory, {
+            "retrieval_history": retrieval_history,
+            "retrieved_results_count": len(retrieved_results),
+            "retrieved_block": retrieved_block,
+            "context_pool_count": len(pool_texts),
+            "excluded_pool_indices": list(exclude_pool_indices or []),
+            "current_chunk_chars": len(current_chunk),
+        }
 
     def _run_infmem(self, *, question: str, document_text: str) -> str:
         input_ids = self.tokenizer.encode(document_text, add_special_tokens=False)

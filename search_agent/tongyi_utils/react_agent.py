@@ -6,7 +6,9 @@ import json
 import json5
 import logging
 import os
-from typing import Dict, List, Optional, Union
+import re
+from abc import ABC, abstractmethod
+from typing import Any, Callable, Dict, List, Optional, Union
 from qwen_agent.llm.schema import Message
 from qwen_agent.utils.utils import build_text_completion_prompt
 from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
@@ -20,19 +22,33 @@ from qwen_agent.settings import MAX_LLM_CALL_PER_RUN
 from qwen_agent.tools import BaseTool
 import time
 
+from searcher.infmem_adapter import InfMemSummarizer, NO_MEMORY
 from tongyi_utils.tool_search import SearchToolHandler, VisitToolHandler
 
 
-def _build_tool_schema(tool_name: str) -> dict:
+logger = logging.getLogger(__name__)
+
+
+def _build_tool_schema(
+    tool_name: str,
+    *,
+    long_doc_mode: str = "truncate",
+    infmem_position: str = "search",
+) -> dict:
     if tool_name == "search":
+        description = (
+            "Search the local BrowseComp-Plus corpus and return the top "
+            "matching results with docids and snippets. Accepts a single query."
+        )
+        if long_doc_mode == "infmem" and infmem_position == "search":
+            description += (
+                " Very long results may be rewritten into query-aware InfMem summaries."
+            )
         return {
             "type": "function",
             "function": {
                 "name": "search",
-                "description": (
-                    "Search the local BrowseComp-Plus corpus and return the top "
-                    "matching results with docids and snippets. Accepts a single query."
-                ),
+                "description": description,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -47,16 +63,22 @@ def _build_tool_schema(tool_name: str) -> dict:
         }
 
     if tool_name == "visit":
+        description = (
+            "Retrieve the full text of a specific local document by docid. "
+            "This local visit tool only accepts an exact docid returned by a "
+            "previous search call, not a URL. It is often useful for checking "
+            "one or two promising search results whose snippets may be partial."
+        )
+        if long_doc_mode == "infmem" and infmem_position == "visit":
+            description += (
+                " Very long visited documents may be returned as InfMem summaries "
+                "instead of full text."
+            )
         return {
             "type": "function",
             "function": {
                 "name": "visit",
-                "description": (
-                    "Retrieve the full text of a specific local document by docid. "
-                    "This local visit tool only accepts an exact docid returned by a "
-                    "previous search call, not a URL. It is often useful for checking "
-                    "one or two promising search results whose snippets may be partial."
-                ),
+                "description": description,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -76,11 +98,30 @@ def _build_tool_schema(tool_name: str) -> dict:
     raise ValueError(f"Unsupported tool name: {tool_name}")
 
 
-def build_system_prompt(tool_names: List[str]) -> str:
-    tool_schemas = [_build_tool_schema(tool_name) for tool_name in tool_names]
+def build_system_prompt(
+    tool_names: List[str],
+    *,
+    long_doc_mode: str = "truncate",
+    infmem_position: str = "search",
+) -> str:
+    tool_schemas = [
+        _build_tool_schema(
+            tool_name,
+            long_doc_mode=long_doc_mode,
+            infmem_position=infmem_position,
+        )
+        for tool_name in tool_names
+    ]
 
     if tool_names == ["search"]:
         tool_usage = "You may call the search tool one or multiple times to assist with the user query."
+        if long_doc_mode == "infmem" and infmem_position == "memory_control":
+            tool_usage += (
+                " Historical tool outputs are compressed into a working memory. "
+                "You will continue to see previous tool-call decisions and the latest "
+                "working memory, but not the full raw search text from earlier rounds. "
+                "If the working memory seems insufficient, call search again."
+            )
     else:
         tool_usage = (
             "You may call the search and visit tools one or multiple times. "
@@ -91,6 +132,18 @@ def build_system_prompt(tool_names: List[str]) -> str:
             "wording. The local visit tool accepts docid only, not URL. When "
             "calling visit, you must copy one exact docid returned by search."
         )
+        if long_doc_mode == "infmem" and infmem_position == "visit":
+            tool_usage += (
+                " When visit returns a very long document, it may provide an InfMem "
+                "summary rather than raw full text."
+            )
+        if long_doc_mode == "infmem" and infmem_position == "memory_control":
+            tool_usage += (
+                " Historical tool outputs are compressed into a working memory. "
+                "You will continue to see previous tool-call decisions and the latest "
+                "working memory, but not the full raw search/visit text from earlier rounds. "
+                "If the working memory seems insufficient, call search or visit again."
+            )
 
     return f"""You are a deep research assistant. Your core function is to conduct thorough, multi-source investigations into any topic. You must handle both broad, open-domain inquiries and queries within specialized academic fields. For every request, synthesize information from credible, diverse sources to deliver a comprehensive, accurate, and objective response. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <answer></answer> tags.
 
@@ -136,21 +189,336 @@ if not any(isinstance(f, _SuppressBuildPromptWarning) for f in _qwen_logger.filt
 def today_date():
     return datetime.date.today().strftime("%Y-%m-%d")
 
+
+def _extract_tool_call_xml(content: str) -> str:
+    match = re.search(r"(<tool_call>.*?</tool_call>)", content or "", re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+class BaseContextController(ABC):
+    name = "base"
+
+    def __init__(self):
+        self.question = ""
+        self.tool_events: List[Dict[str, Any]] = []
+        self.system_prompt = ""
+
+    @abstractmethod
+    def build_initial_messages(self, *, system_prompt: str, question: str) -> List[Dict[str, str]]:
+        pass
+
+    @abstractmethod
+    def record_tool_result(
+        self,
+        *,
+        tool_name: str,
+        tool_args: dict,
+        tool_response: str,
+        docids: Optional[List[str]],
+        tool_data: Optional[dict],
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def build_next_messages(self, *, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        pass
+
+    def record_assistant_message(self, *, content: str) -> None:
+        return None
+
+    def spawn(self) -> "BaseContextController":
+        return self.__class__()
+
+    def export_state(self) -> Dict[str, Any]:
+        return {
+            "question": self.question,
+            "tool_events": list(self.tool_events),
+        }
+
+
+class StandardConversationController(BaseContextController):
+    name = "standard"
+
+    def build_initial_messages(self, *, system_prompt: str, question: str) -> List[Dict[str, str]]:
+        self.system_prompt = system_prompt
+        self.question = question
+        self.tool_events = []
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ]
+
+    def record_tool_result(
+        self,
+        *,
+        tool_name: str,
+        tool_args: dict,
+        tool_response: str,
+        docids: Optional[List[str]],
+        tool_data: Optional[dict],
+    ) -> None:
+        return None
+
+    def build_next_messages(self, *, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        return messages
+
+    def export_state(self) -> Dict[str, Any]:
+        return {}
+
+
+class InfMemMemoryControl(StandardConversationController):
+    name = "infmem_memory_control"
+
+    def __init__(self, infmem_summarizer: InfMemSummarizer):
+        super().__init__()
+        self.infmem_summarizer = infmem_summarizer
+        self.memory = NO_MEMORY
+        self.assistant_tool_calls: List[str] = []
+        self.raw_context_pool: List[Dict[str, Any]] = []
+        self.memory_updates: List[Dict[str, Any]] = []
+
+    def build_initial_messages(self, *, system_prompt: str, question: str) -> List[Dict[str, str]]:
+        self.system_prompt = system_prompt
+        self.question = question
+        self.tool_events = []
+        self.memory = NO_MEMORY
+        self.assistant_tool_calls = []
+        self.raw_context_pool = []
+        self.memory_updates = []
+        return self.build_next_messages(messages=[])
+
+    def spawn(self) -> "BaseContextController":
+        return self.__class__(infmem_summarizer=self.infmem_summarizer)
+
+    def record_assistant_message(self, *, content: str) -> None:
+        tool_call_xml = _extract_tool_call_xml(content)
+        if tool_call_xml:
+            self.assistant_tool_calls.append(tool_call_xml)
+
+    def _build_search_current_chunk(self, tool_data: dict) -> tuple[str, List[Dict[str, Any]]]:
+        entries = []
+        current_parts = []
+        for idx, item in enumerate(tool_data.get("results", []), 1):
+            raw_text = str(item.get("raw_text", "")).strip()
+            if not raw_text:
+                continue
+            docid = str(item.get("docid", ""))
+            entries.append(
+                {
+                    "sequence": len(self.raw_context_pool) + len(entries) + 1,
+                    "tool_name": "search",
+                    "query": tool_data.get("query", ""),
+                    "docid": docid,
+                    "raw_text": raw_text,
+                }
+            )
+            current_parts.append(
+                f"[Search result #{idx}] docid={docid}\n{raw_text}"
+            )
+        return "\n\n".join(current_parts), entries
+
+    def _build_visit_current_chunk(self, tool_data: dict) -> tuple[str, List[Dict[str, Any]]]:
+        raw_text = str(tool_data.get("raw_text", "")).strip()
+        if not raw_text:
+            return "", []
+        docid = str(tool_data.get("docid", ""))
+        return (
+            f"[Visited document] docid={docid}\n{raw_text}",
+            [
+                {
+                    "sequence": len(self.raw_context_pool) + 1,
+                    "tool_name": "visit",
+                    "docid": docid,
+                    "raw_text": raw_text,
+                }
+            ],
+        )
+
+    def _build_current_chunk(self, *, tool_name: str, tool_data: dict) -> tuple[str, List[Dict[str, Any]]]:
+        if tool_name == "search":
+            return self._build_search_current_chunk(tool_data)
+        if tool_name == "visit":
+            return self._build_visit_current_chunk(tool_data)
+        return "", []
+
+    def _summarize_raw_context_pool(self) -> List[Dict[str, Any]]:
+        summary = []
+        for item in self.raw_context_pool:
+            summary.append(
+                {
+                    "sequence": item["sequence"],
+                    "tool_name": item["tool_name"],
+                    "query": item.get("query"),
+                    "docid": item.get("docid"),
+                    "char_count": len(item.get("raw_text", "")),
+                    "preview": item.get("raw_text", "")[:160],
+                }
+            )
+        return summary
+
+    def record_tool_result(
+        self,
+        *,
+        tool_name: str,
+        tool_args: dict,
+        tool_response: str,
+        docids: Optional[List[str]],
+        tool_data: Optional[dict],
+    ) -> None:
+        event: Dict[str, Any] = {
+            "sequence": len(self.tool_events) + 1,
+            "tool_name": tool_name,
+            "tool_args": dict(tool_args or {}),
+            "docids": list(docids or []),
+        }
+        tool_data = tool_data or {}
+        current_chunk, pool_entries = self._build_current_chunk(
+            tool_name=tool_name,
+            tool_data=tool_data,
+        )
+        excluded_pool_indices = [entry["sequence"] - 1 for entry in pool_entries]
+        self.raw_context_pool.extend(pool_entries)
+
+        if tool_name == "search":
+            event["search"] = {
+                "query": tool_data.get("query", tool_args.get("query", "")),
+                "results": [
+                    {
+                        "docid": item.get("docid"),
+                        "snippet": item.get("snippet", ""),
+                        "raw_text_chars": len(item.get("raw_text", "")),
+                        "score": item.get("score"),
+                        "used_infmem_summary": item.get("used_infmem_summary", False),
+                    }
+                    for item in tool_data.get("results", [])
+                ],
+            }
+        elif tool_name == "visit":
+            visit_text = str(tool_data.get("text", ""))
+            event["visit"] = {
+                "docid": tool_data.get("docid", tool_args.get("docid", "")),
+                "text_preview": visit_text[:200],
+                "text_chars": len(visit_text),
+                "raw_text_chars": len(tool_data.get("raw_text", "")),
+                "is_summary": tool_data.get("is_summary", False),
+                "used_infmem_summary": tool_data.get("used_infmem_summary", False),
+                "original_token_count": tool_data.get("original_token_count", -1),
+            }
+        else:
+            event["tool_response"] = tool_response
+
+        if current_chunk:
+            try:
+                updated_memory, update_meta = self.infmem_summarizer.update_memory_with_context_pool(
+                    question=self.question,
+                    previous_memory=self.memory,
+                    current_chunk=current_chunk,
+                    context_pool_texts=[item.get("raw_text", "") for item in self.raw_context_pool],
+                    exclude_pool_indices=excluded_pool_indices,
+                )
+                self.memory = updated_memory
+                event["memory_update"] = {
+                    "memory_chars": len(self.memory),
+                    "retrieval_history": update_meta.get("retrieval_history", []),
+                    "retrieved_results_count": update_meta.get("retrieved_results_count", 0),
+                    "context_pool_count": update_meta.get("context_pool_count", 0),
+                }
+                self.memory_updates.append(
+                    {
+                        "sequence": event["sequence"],
+                        "tool_name": tool_name,
+                        "memory": self.memory,
+                        "meta": update_meta,
+                    }
+                )
+            except Exception as exc:
+                logger.warning(
+                    "InfMem memory-control update failed for tool=%s on question=%r: %s",
+                    tool_name,
+                    self.question,
+                    exc,
+                )
+                event["memory_update"] = {
+                    "memory_chars": len(self.memory),
+                    "error": str(exc),
+                    "context_pool_count": len(self.raw_context_pool),
+                }
+
+        self.tool_events.append(event)
+
+    def build_next_messages(self, *, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        rebuilt_messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": self.question},
+        ]
+        rebuilt_messages.extend(
+            {"role": "assistant", "content": tool_call}
+            for tool_call in self.assistant_tool_calls
+        )
+        if self.memory and self.memory != NO_MEMORY:
+            rebuilt_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Working memory accumulated from previous search/visit results. "
+                        "Historical raw retrieval text has been compressed into this memory.\n"
+                        "<memory_context>\n"
+                        f"{self.memory}\n"
+                        "</memory_context>"
+                    ),
+                }
+            )
+        return rebuilt_messages
+
+    def export_state(self) -> Dict[str, Any]:
+        return {
+            "question": self.question,
+            "memory": self.memory,
+            "tool_events": list(self.tool_events),
+            "assistant_tool_calls": list(self.assistant_tool_calls),
+            "raw_context_pool": self._summarize_raw_context_pool(),
+            "memory_updates": [
+                {
+                    "sequence": item["sequence"],
+                    "tool_name": item["tool_name"],
+                    "memory_chars": len(item["memory"]),
+                    "retrieval_history": item["meta"].get("retrieval_history", []),
+                    "retrieved_results_count": item["meta"].get("retrieved_results_count", 0),
+                }
+                for item in self.memory_updates
+            ],
+        }
+
 class MultiTurnReactAgent(FnCallAgent):
     def __init__(self,
                  function_list: Optional[List[Union[str, Dict, BaseTool]]] = None,
                  llm: Optional[Union[Dict, BaseChatModel]] = None,
                  search_tool_handler: Optional[SearchToolHandler] = None,
                  visit_tool_handler: Optional[VisitToolHandler] = None,
+                 context_controller: Optional[Union[BaseContextController, Callable[[], BaseContextController], type]] = None,
+                 long_doc_mode: str = "truncate",
+                 infmem_position: str = "search",
                  **kwargs):
 
         self.llm_generate_cfg = llm["generate_cfg"]
         self.llm_local_path = llm["model"]
+        self.long_doc_mode = long_doc_mode
+        self.infmem_position = infmem_position
         self.tool_handlers = {}
         if search_tool_handler is not None:
             self.tool_handlers["search"] = search_tool_handler
         if visit_tool_handler is not None:
             self.tool_handlers["visit"] = visit_tool_handler
+        if context_controller is None:
+            self.context_controller_factory = StandardConversationController
+        elif isinstance(context_controller, type):
+            self.context_controller_factory = context_controller
+        elif callable(context_controller) and not isinstance(context_controller, BaseContextController):
+            self.context_controller_factory = context_controller
+        else:
+            self.context_controller_factory = context_controller.spawn
 
         self.tool_names = [
             tool_name
@@ -234,15 +602,24 @@ class MultiTurnReactAgent(FnCallAgent):
         tool_call_counts = {}  # Only successful tool calls
         tool_call_counts_all = {}  # All tool calls (successful and failed)
         retrieved_docids = []
+        context_controller = self.context_controller_factory()
 
         start_time = time.time()
         planning_port = data['planning_port']
         answer = data['item']['answer']
         self.user_prompt = question
-        system_prompt = build_system_prompt(self.tool_names)
+        system_prompt = build_system_prompt(
+            self.tool_names,
+            long_doc_mode=self.long_doc_mode,
+            infmem_position=self.infmem_position,
+        )
         cur_date = today_date()
         system_prompt = system_prompt + str(cur_date)
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
+        messages = context_controller.build_initial_messages(
+            system_prompt=system_prompt,
+            question=question,
+        )
+        messages = context_controller.build_next_messages(messages=messages)
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
         while num_llm_calls_available > 0:
@@ -257,7 +634,9 @@ class MultiTurnReactAgent(FnCallAgent):
                     "termination": termination,
                     "tool_call_counts": tool_call_counts,
                     "tool_call_counts_all": tool_call_counts_all,
-                    "retrieved_docids": list(set(retrieved_docids))
+                    "retrieved_docids": list(set(retrieved_docids)),
+                    "context_controller": context_controller.name,
+                    "context_controller_state": context_controller.export_state(),
                 }
                 return result
             round += 1
@@ -269,6 +648,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 content = content[:pos]
             messages.append({"role": "assistant", "content": content.strip()})
             if '<tool_call>' in content and '</tool_call>' in content:
+                context_controller.record_assistant_message(content=content.strip())
                 tool_call = content.split('<tool_call>')[1].split('</tool_call>')[0]
                 try:
                     tool_call = json5.loads(tool_call)
@@ -277,10 +657,17 @@ class MultiTurnReactAgent(FnCallAgent):
 
                     tool_call_counts_all[tool_name] = tool_call_counts_all.get(tool_name, 0) + 1
 
-                    result, docids = self.custom_call_tool(
+                    result, docids, tool_data = self.custom_call_tool(
                         tool_name,
                         tool_args,
                         original_question=question,
+                    )
+                    context_controller.record_tool_result(
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        tool_response=result,
+                        docids=docids,
+                        tool_data=tool_data,
                     )
 
                     if docids is not None:
@@ -292,6 +679,7 @@ class MultiTurnReactAgent(FnCallAgent):
                     result = 'Error: Tool call is not a valid JSON. Tool call must contain a valid "name" and "arguments" field.'
                 result = "<tool_response>\n" + result + "\n</tool_response>"
                 messages.append({"role": "user", "content": result})
+                messages = context_controller.build_next_messages(messages=messages)
             if '<answer>' in content and '</answer>' in content:
                 termination = 'answer'
                 break
@@ -322,7 +710,9 @@ class MultiTurnReactAgent(FnCallAgent):
                     "termination": termination,
                     "tool_call_counts": tool_call_counts,
                     "tool_call_counts_all": tool_call_counts_all,
-                    "retrieved_docids": list(set(retrieved_docids))
+                    "retrieved_docids": list(set(retrieved_docids)),
+                    "context_controller": context_controller.name,
+                    "context_controller_state": context_controller.export_state(),
                 }
                 return result
 
@@ -342,12 +732,21 @@ class MultiTurnReactAgent(FnCallAgent):
             "termination": termination,
             "tool_call_counts": tool_call_counts,
             "tool_call_counts_all": tool_call_counts_all,
-            "retrieved_docids": list(set(retrieved_docids))
+            "retrieved_docids": list(set(retrieved_docids)),
+            "context_controller": context_controller.name,
+            "context_controller_state": context_controller.export_state(),
         }
         return result
 
     def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
         handler = self.tool_handlers.get(tool_name)
         if handler is None:
-            return f"Error: Tool {tool_name} not found", None
-        return handler.call(tool_args, **kwargs)
+            return f"Error: Tool {tool_name} not found", None, None
+
+        result = handler.call(tool_args, **kwargs)
+        if isinstance(result, tuple):
+            if len(result) == 3:
+                return result
+            if len(result) == 2:
+                return result[0], result[1], None
+        return result, None, None

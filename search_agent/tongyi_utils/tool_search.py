@@ -1,7 +1,7 @@
 import json
 import logging
 import sys
-from typing import List, Union
+from typing import Any, Dict, List, Union
 
 from qwen_agent.tools.base import BaseTool, register_tool
 from transformers import AutoTokenizer
@@ -12,31 +12,19 @@ from searcher.infmem_adapter import InfMemSummarizer
 logger = logging.getLogger(__name__)
 
 
-@register_tool("search", allow_overwrite=True)
-class SearchToolHandler(BaseTool):
-    name = "search"
-
+class LongDocInfMemHandler:
     def __init__(
         self,
-        searcher,
+        *,
         snippet_max_tokens: int = 512,
-        k: int = 5,
         long_doc_mode: str = "truncate",
+        infmem_position: str = "search",
         infmem_summarizer: InfMemSummarizer | None = None,
     ):
-        super().__init__()
-
-        self.searcher = searcher
         self.snippet_max_tokens = snippet_max_tokens
-        self.k = k
         self.long_doc_mode = long_doc_mode
+        self.infmem_position = infmem_position
         self.infmem_summarizer = infmem_summarizer
-
-        self.description = (
-            f"Search the local BrowseComp-Plus corpus using one 'query' string and "
-            f"return the top {self.k} matching results. Each result is only a preview "
-            "snippet, not the full document."
-        )
 
         self.tokenizer = None
         if snippet_max_tokens and snippet_max_tokens > 0:
@@ -59,6 +47,164 @@ class SearchToolHandler(BaseTool):
             )
         return text, len(tokens)
 
+    def _should_use_infmem(self, *, target: str, doc_token_count: int) -> bool:
+        return (
+            self.long_doc_mode == "infmem"
+            and self.infmem_position == target
+            and self.infmem_summarizer is not None
+            and self.snippet_max_tokens is not None
+            and self.snippet_max_tokens > 0
+            and doc_token_count > self.snippet_max_tokens
+        )
+
+    def build_search_snippet(
+        self,
+        *,
+        docid: str,
+        document_text: str,
+        question: str,
+    ) -> Dict[str, Any]:
+        snippet, doc_token_count = self._truncate_with_count(
+            document_text,
+            self.snippet_max_tokens,
+        )
+        snippet_truncated = (
+            doc_token_count > self.snippet_max_tokens
+            if (
+                self.snippet_max_tokens is not None
+                and self.snippet_max_tokens > 0
+                and doc_token_count >= 0
+            )
+            else False
+        )
+
+        if self._should_use_infmem(target="search", doc_token_count=doc_token_count):
+            try:
+                summary = self.infmem_summarizer.summarize_document(
+                    docid=docid,
+                    document_text=document_text,
+                    question=question,
+                )
+                logger.info(
+                    "InfMem summary generated for search docid=%s using question=%r",
+                    docid,
+                    question,
+                )
+                return {
+                    "snippet": summary,
+                    "doc_token_count": doc_token_count,
+                    "snippet_truncated": snippet_truncated,
+                    "used_infmem_summary": True,
+                }
+            except Exception as exc:
+                logger.warning(
+                    "InfMem summarization failed for search docid=%s; falling back to truncation: %s",
+                    docid,
+                    exc,
+                )
+
+        return {
+            "snippet": snippet,
+            "doc_token_count": doc_token_count,
+            "snippet_truncated": snippet_truncated,
+            "used_infmem_summary": False,
+        }
+
+    def build_visit_document(
+        self,
+        *,
+        docid: str,
+        document: Dict[str, Any],
+        question: str,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        processed = dict(document)
+        processed.setdefault("docid", docid)
+
+        document_text = str(processed.get("text", ""))
+        if not document_text:
+            return processed, {
+                "doc_token_count": -1,
+                "used_infmem_summary": False,
+                "text_is_summary": False,
+                "returned_text": document_text,
+            }
+
+        _, doc_token_count = self._truncate_with_count(
+            document_text,
+            self.snippet_max_tokens,
+        )
+
+        if self._should_use_infmem(target="visit", doc_token_count=doc_token_count):
+            try:
+                summary = self.infmem_summarizer.summarize_document(
+                    docid=docid,
+                    document_text=document_text,
+                    question=question,
+                )
+                processed["text"] = summary
+                processed["text_is_summary"] = True
+                processed["summary_method"] = "infmem"
+                processed["original_token_count"] = doc_token_count
+                logger.info(
+                    "InfMem summary generated for visit docid=%s using question=%r",
+                    docid,
+                    question,
+                )
+                return processed, {
+                    "doc_token_count": doc_token_count,
+                    "used_infmem_summary": True,
+                    "text_is_summary": True,
+                    "returned_text": summary,
+                    "original_token_count": doc_token_count,
+                }
+            except Exception as exc:
+                logger.warning(
+                    "InfMem summarization failed for visit docid=%s; returning full document: %s",
+                    docid,
+                    exc,
+                )
+
+        return processed, {
+            "doc_token_count": doc_token_count,
+            "used_infmem_summary": False,
+            "text_is_summary": False,
+            "returned_text": document_text,
+        }
+
+
+@register_tool("search", allow_overwrite=True)
+class SearchToolHandler(BaseTool):
+    name = "search"
+
+    def __init__(
+        self,
+        searcher,
+        snippet_max_tokens: int = 512,
+        k: int = 5,
+        long_doc_mode: str = "truncate",
+        infmem_summarizer: InfMemSummarizer | None = None,
+        infmem_position: str = "search",
+    ):
+        super().__init__()
+
+        self.searcher = searcher
+        self.snippet_max_tokens = snippet_max_tokens
+        self.k = k
+        self.long_doc_mode = long_doc_mode
+        self.infmem_position = infmem_position
+        self.long_doc_handler = LongDocInfMemHandler(
+            snippet_max_tokens=snippet_max_tokens,
+            long_doc_mode=long_doc_mode,
+            infmem_position=infmem_position,
+            infmem_summarizer=infmem_summarizer,
+        )
+
+        self.description = (
+            f"Search the local BrowseComp-Plus corpus using one 'query' string and "
+            f"return the top {self.k} matching results. Each result is only a preview "
+            "snippet, not the full document."
+        )
+
     def _format_results(self, results: List[dict], max_tokens: int):
         formatted = []
         for idx, r in enumerate(results, 1):
@@ -77,7 +223,7 @@ class SearchToolHandler(BaseTool):
 
             snippet = r.get("snippet")
             if snippet is None:
-                snippet, _ = self._truncate_with_count(passage_text, max_tokens)
+                snippet, _ = self.long_doc_handler._truncate_with_count(passage_text, max_tokens)
             formatted_result = f"{idx}. [{title}] (docid: {docid})\n{snippet}"
             formatted.append(formatted_result)
 
@@ -96,59 +242,38 @@ class SearchToolHandler(BaseTool):
             results = self.searcher.search(query, k)
 
             if not results:
-                return f"No results found for '{query}'. Try with a more general query.", []
+                return f"No results found for '{query}'. Try with a more general query.", [], {
+                    "query": query,
+                    "original_question": original_question,
+                    "results": [],
+                }
 
             docids = []
             for r in results:
                 if "docid" in r:
                     docids.append(str(r["docid"]))
 
+            result_metadata = []
             for result in results:
                 passage_text = result["text"]
-                snippet, doc_token_count = self._truncate_with_count(
-                    passage_text, self.snippet_max_tokens
+                question = (original_question or query).strip() or query
+                long_doc_result = self.long_doc_handler.build_search_snippet(
+                    docid=str(result["docid"]),
+                    document_text=passage_text,
+                    question=question,
                 )
-                result["doc_token_count"] = doc_token_count
-                result["snippet_truncated"] = (
-                    doc_token_count > self.snippet_max_tokens
-                    if (
-                        self.snippet_max_tokens is not None
-                        and self.snippet_max_tokens > 0
-                        and doc_token_count >= 0
-                    )
-                    else False
+                result.update(long_doc_result)
+                result_metadata.append(
+                    {
+                        "docid": str(result["docid"]),
+                        "score": result.get("score"),
+                        "snippet": result["snippet"],
+                        "raw_text": passage_text,
+                        "snippet_truncated": result["snippet_truncated"],
+                        "doc_token_count": result["doc_token_count"],
+                        "used_infmem_summary": result["used_infmem_summary"],
+                    }
                 )
-
-                should_use_infmem = (
-                    self.long_doc_mode == "infmem"
-                    and self.infmem_summarizer is not None
-                    and self.snippet_max_tokens is not None
-                    and self.snippet_max_tokens > 0
-                    and doc_token_count > self.snippet_max_tokens
-                )
-
-                if should_use_infmem:
-                    question = (original_question or query).strip() or query
-                    try:
-                        result["snippet"] = self.infmem_summarizer.summarize_document(
-                            docid=str(result["docid"]),
-                            document_text=passage_text,
-                            question=question,
-                        )
-                        logger.info(
-                            "InfMem summary generated for docid=%s using question=%r",
-                            result["docid"],
-                            question,
-                        )
-                        continue
-                    except Exception as exc:
-                        logger.warning(
-                            "InfMem summarization failed for docid=%s; falling back to truncation: %s",
-                            result["docid"],
-                            exc,
-                        )
-
-                result["snippet"] = snippet
 
             formatted_results = self._format_results(results, self.snippet_max_tokens)
 
@@ -159,10 +284,17 @@ class SearchToolHandler(BaseTool):
                 "shown below is often useful before answering.\n\n## Corpus Results\n"
                 + "\n\n".join(formatted_results)
             )
-            return content, docids
+            return content, docids, {
+                "query": query,
+                "original_question": original_question,
+                "results": result_metadata,
+            }
 
         except Exception as e:
-            return f"Search error for query '{query}': {str(e)}", []
+            return f"Search error for query '{query}': {str(e)}", [], {
+                "query": query,
+                "error": str(e),
+            }
 
     def call(self, params: Union[str, dict], **kwargs):
         try:
@@ -176,21 +308,34 @@ class SearchToolHandler(BaseTool):
             else:
                 return "[Search] Invalid request format: 'query' must be a string, not an array", None
 
-        response, docids = self.search_with_searcher(
+        response, docids, tool_data = self.search_with_searcher(
             query,
             original_question=kwargs.get("original_question"),
         )
-        return response, docids
+        return response, docids, tool_data
 
 
 @register_tool("visit", allow_overwrite=True)
 class VisitToolHandler(BaseTool):
     name = "visit"
 
-    def __init__(self, searcher):
+    def __init__(
+        self,
+        searcher,
+        snippet_max_tokens: int = 512,
+        long_doc_mode: str = "truncate",
+        infmem_summarizer: InfMemSummarizer | None = None,
+        infmem_position: str = "search",
+    ):
         super().__init__()
 
         self.searcher = searcher
+        self.long_doc_handler = LongDocInfMemHandler(
+            snippet_max_tokens=snippet_max_tokens,
+            long_doc_mode=long_doc_mode,
+            infmem_position=infmem_position,
+            infmem_summarizer=infmem_summarizer,
+        )
         self.description = (
             "Retrieve the full contents of one promising document by supplying its "
             "exact 'docid' from a previous search result. This local visit tool only "
@@ -199,6 +344,11 @@ class VisitToolHandler(BaseTool):
             "two promising results is often worthwhile. Do not pass a URL, title, "
             "rank, or snippet text."
         )
+        if long_doc_mode == "infmem" and infmem_position == "visit":
+            self.description += (
+                " When a visited document is very long, this tool may return an "
+                "InfMem summary instead of the full text."
+            )
 
     def call(self, params: Union[str, dict], **kwargs):
         try:
@@ -225,4 +375,19 @@ class VisitToolHandler(BaseTool):
         if result is None:
             return f"[Visit] Document with docid '{docid}' not found.", None
 
-        return json.dumps(result, ensure_ascii=False, indent=2), [docid]
+        question = (kwargs.get("original_question") or docid).strip() or docid
+        processed_result, visit_meta = self.long_doc_handler.build_visit_document(
+            docid=docid,
+            document=result,
+            question=question,
+        )
+        tool_data = {
+            "docid": docid,
+            "document": processed_result,
+            "text": visit_meta.get("returned_text", ""),
+            "raw_text": str(result.get("text", "")),
+            "is_summary": visit_meta.get("text_is_summary", False),
+            "used_infmem_summary": visit_meta.get("used_infmem_summary", False),
+            "original_token_count": visit_meta.get("original_token_count", visit_meta.get("doc_token_count", -1)),
+        }
+        return json.dumps(processed_result, ensure_ascii=False, indent=2), [docid], tool_data

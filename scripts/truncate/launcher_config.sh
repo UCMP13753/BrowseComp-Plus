@@ -11,6 +11,7 @@ MCP_SEARCHER_TYPE="${MCP_SEARCHER_TYPE:-bm25}"
 MODEL_PATH="${MODEL_PATH:-/work/mingze/models/Tongyi-DeepResearch-30B-A3B}"
 MODEL_NAME="${MODEL_NAME:-${MODEL_PATH}}"
 MCP_LONG_DOC_MODE="truncate"
+MCP_INFMEM_POSITION="${MCP_INFMEM_POSITION:-search}"
 
 if [[ "${MCP_SEARCHER_TYPE}" == "faiss" ]]; then
   DEFAULT_MCP_INDEX_PATH="${REPO_ROOT}/indexes/qwen3-embedding-8b/corpus.shard*.pkl"
@@ -54,14 +55,35 @@ TONGYI_TEMPERATURE="${TONGYI_TEMPERATURE:-0.85}"
 TONGYI_TOP_P="${TONGYI_TOP_P:-0.95}"
 TONGYI_PRESENCE_PENALTY="${TONGYI_PRESENCE_PENALTY:-1.1}"
 TONGYI_STORE_RAW="${TONGYI_STORE_RAW:-0}"
-TONGYI_TOOLSET="${TONGYI_TOOLSET:-standard}"
+if [[ -z "${TONGYI_TOOLSET+x}" ]]; then
+  if [[ "${MCP_LONG_DOC_MODE}" == "infmem" && "${MCP_INFMEM_POSITION}" == "visit" ]]; then
+    TONGYI_TOOLSET="custom"
+  else
+    TONGYI_TOOLSET="standard"
+  fi
+fi
+
+INFMEM_POSITION_RUN_SUFFIX="${INFMEM_POSITION_RUN_SUFFIX:-}"
+if [[ -z "${INFMEM_POSITION_RUN_SUFFIX}" && "${MCP_LONG_DOC_MODE}" == "infmem" ]]; then
+  case "${MCP_INFMEM_POSITION}" in
+    visit)
+      INFMEM_POSITION_RUN_SUFFIX="_visit_infmem"
+      ;;
+    memory_control)
+      INFMEM_POSITION_RUN_SUFFIX="_memctrl_infmem"
+      ;;
+    *)
+      INFMEM_POSITION_RUN_SUFFIX=""
+      ;;
+  esac
+fi
 
 MODEL_BASENAME="${MODEL_BASENAME:-$(basename "${MODEL_PATH}")}"
 TONGYI_TOOLSET_RUN_SUFFIX="${TONGYI_TOOLSET_RUN_SUFFIX:-}"
 if [[ -z "${TONGYI_TOOLSET_RUN_SUFFIX}" && "${TONGYI_TOOLSET}" == "custom" ]]; then
   TONGYI_TOOLSET_RUN_SUFFIX="_custom"
 fi
-RUN_TAG="${RUN_TAG:-${MCP_SEARCHER_TYPE}_${MCP_LONG_DOC_MODE}${TONGYI_TOOLSET_RUN_SUFFIX}}"
+RUN_TAG="${RUN_TAG:-${MCP_SEARCHER_TYPE}_${MCP_LONG_DOC_MODE}${TONGYI_TOOLSET_RUN_SUFFIX}${INFMEM_POSITION_RUN_SUFFIX}}"
 RUN_NAME="${RUN_NAME:-${MODEL_BASENAME}_${RUN_TAG}}"
 
 VLLM_LOG_PATH="${VLLM_LOG_PATH:-${REPO_ROOT}/logs/truncate/${RUN_NAME}_vllm.log}"

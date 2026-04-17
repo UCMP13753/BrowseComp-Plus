@@ -45,9 +45,9 @@ python scripts_evaluation/evaluate_run.py --input_dir runs/qwen3-8/tongyi --tens
 ```
 > where you may replace `--tensor_parallel_size` with the number of GPUs you have to inference with Qwen3-32B, our primary judge model.
 
-## Tongyi With InfMem Search Summaries
+## Tongyi With InfMem
 
-If you want Tongyi's local `search` tool to summarize long retrieved documents with InfMem instead of plain truncation, first launch the Tongyi answer model and the InfMem memory model separately:
+If you want Tongyi to use InfMem, first launch the Tongyi answer model and the InfMem memory model separately:
 
 ```bash
 vllm serve Alibaba-NLP/Tongyi-DeepResearch-30B-A3B --port 6008 --tensor-parallel-size {num_gpus}
@@ -57,7 +57,11 @@ vllm serve Alibaba-NLP/Tongyi-DeepResearch-30B-A3B --port 6008 --tensor-parallel
 vllm serve /work/mingze/models/qwen4b_infmem_earlystop_stage2/global_step_150/huggingface --port 8001 --tensor-parallel-size {num_gpus_for_memory}
 ```
 
-Then run the Tongyi client with `--long-doc-mode infmem`:
+Then run the Tongyi client with `--long-doc-mode infmem`. You can choose where InfMem is applied with `--infmem-position`.
+
+### InfMem In Search
+
+This is the default behavior for backward compatibility. Long search results are rewritten into query-aware InfMem summaries before being returned as snippets.
 
 ```bash
 python search_agent/tongyi_client.py \
@@ -66,10 +70,52 @@ python search_agent/tongyi_client.py \
   --index-path indexes/bm25 \
   --port 6008 \
   --long-doc-mode infmem \
+  --infmem-position search \
   --snippet-max-tokens 1024 \
   --infmem-model /work/mingze/models/qwen4b_infmem_earlystop_stage2/global_step_150/huggingface \
   --infmem-model-server http://127.0.0.1:8001/v1 \
   --num-threads 10
 ```
 
-This path does not require MCP. The Tongyi client still uses its in-process local search tool, but long documents are now rewritten into query-aware InfMem summaries before being returned to the model.
+This path does not require MCP. The Tongyi client still uses its in-process local search tool, but long documents are rewritten into query-aware InfMem summaries before being returned to the model.
+
+### InfMem In Visit
+
+If you want `visit` to summarize very long documents instead, enable the custom toolset and set `--infmem-position visit`:
+
+```bash
+python search_agent/tongyi_client.py \
+  --output-dir runs/bm25/tongyi_infmem_visit \
+  --searcher-type bm25 \
+  --index-path indexes/bm25 \
+  --port 6008 \
+  --toolset custom \
+  --long-doc-mode infmem \
+  --infmem-position visit \
+  --snippet-max-tokens 1024 \
+  --infmem-model /work/mingze/models/qwen4b_infmem_earlystop_stage2/global_step_150/huggingface \
+  --infmem-model-server http://127.0.0.1:8001/v1 \
+  --num-threads 10
+```
+
+In this mode, `search` still returns normal snippets, while `visit` returns an InfMem summary only for long documents. Short visited documents are returned in full.
+
+### Memory-Control Placeholder
+
+You may also select `--infmem-position memory_control`:
+
+```bash
+python search_agent/tongyi_client.py \
+  --output-dir runs/bm25/tongyi_infmem_memctrl_stub \
+  --searcher-type bm25 \
+  --index-path indexes/bm25 \
+  --port 6008 \
+  --long-doc-mode infmem \
+  --infmem-position memory_control \
+  --snippet-max-tokens 1024 \
+  --infmem-model /work/mingze/models/qwen4b_infmem_earlystop_stage2/global_step_150/huggingface \
+  --infmem-model-server http://127.0.0.1:8001/v1 \
+  --num-threads 10
+```
+
+At the moment this only enables a placeholder interface: Tongyi still uses the standard multi-turn React message accumulation, but it records retrieval events for a future memory-control implementation.

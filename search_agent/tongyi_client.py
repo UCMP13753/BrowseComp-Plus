@@ -13,15 +13,24 @@ from pathlib import Path
 from datetime import datetime, timezone
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-from tongyi_utils.react_agent import MultiTurnReactAgent
+from tongyi_utils.react_agent import (
+    InfMemMemoryControl,
+    MultiTurnReactAgent,
+    StandardConversationController,
+)
 from tongyi_utils.tool_search import SearchToolHandler, VisitToolHandler
 from searcher.infmem_adapter import InfMemConfig, InfMemSummarizer
 from searcher.searchers import SearcherType
 import re
 
 
-def parse_messages_to_result_array(messages: list) -> list:
+def parse_messages_to_result_array(messages: list, context_controller_state: dict | None = None) -> list:
     result_array = []
+    tool_events = {
+        idx + 1: event
+        for idx, event in enumerate((context_controller_state or {}).get("tool_events", []))
+    }
+    tool_call_index = 0
 
     for i, msg in enumerate(messages):
         if msg.get("role") != "assistant":
@@ -53,6 +62,24 @@ def parse_messages_to_result_array(messages: list) -> list:
                     response_match = re.search(r'<tool_response>\n(.*?)\n</tool_response>', next_content, re.DOTALL)
                     if response_match:
                         tool_output = response_match.group(1).strip()
+                if not tool_output:
+                    tool_call_index += 1
+                    tool_event = tool_events.get(tool_call_index, {})
+                    if tool_name == "search":
+                        search_event = tool_event.get("search", {})
+                        query = search_event.get("query")
+                        hits = len(search_event.get("results", []))
+                        if query:
+                            tool_output = f"[memory_control] search query={query!r}, hits={hits}"
+                    elif tool_name == "visit":
+                        visit_event = tool_event.get("visit", {})
+                        docid = visit_event.get("docid")
+                        if docid:
+                            tool_output = f"[memory_control] visit docid={docid}"
+                    else:
+                        tool_output = tool_event.get("tool_response", "")
+                else:
+                    tool_call_index += 1
 
                 result_array.append({
                     "type": "tool_call",
@@ -85,7 +112,10 @@ def persist_response(output_dir: Path, query_id: str | None, query: str, result:
     prediction = result.get("prediction", "")
     ground_truth_answer = result.get("answer", "")
 
-    result_array = parse_messages_to_result_array(result.get("messages", []))
+    result_array = parse_messages_to_result_array(
+        result.get("messages", []),
+        context_controller_state=result.get("context_controller_state", {}),
+    )
 
     output_data = {
         "metadata": {
@@ -98,8 +128,10 @@ def persist_response(output_dir: Path, query_id: str | None, query: str, result:
             "searcher_type": args.searcher_type,
             "toolset": args.toolset,
             "long_doc_mode": args.long_doc_mode,
+            "infmem_position": args.infmem_position,
             "infmem_model": args.infmem_model,
             "infmem_model_server": args.infmem_model_server,
+            "context_controller": result.get("context_controller", "standard"),
         },
         "query_id": query_id,
         "question": query,
@@ -110,7 +142,8 @@ def persist_response(output_dir: Path, query_id: str | None, query: str, result:
         "tool_call_counts_all": result.get("tool_call_counts_all", {}),
         "status": status,
         "retrieved_docids": sorted(result.get("retrieved_docids", [])),
-        "result": result_array
+        "result": result_array,
+        "context_controller_state": result.get("context_controller_state", {}),
     }
 
     if getattr(args, 'store_raw', False):
@@ -232,6 +265,12 @@ def main():
         help="How to handle documents longer than --snippet-max-tokens. 'truncate' returns the leading snippet, while 'infmem' returns a query-aware InfMem summary.",
     )
     parser.add_argument(
+        "--infmem-position",
+        choices=["search", "visit", "memory_control"],
+        default="search",
+        help="Where to apply InfMem when --long-doc-mode=infmem. 'search' summarizes long search snippets, 'visit' summarizes long visited documents, and 'memory_control' uses a hidden raw-context pool plus InfMem memory updates to keep the visible React context compact.",
+    )
+    parser.add_argument(
         "--infmem-model",
         type=str,
         help="Judge/read model to use for InfMem long-document summarization. Required when --long-doc-mode=infmem.",
@@ -280,6 +319,8 @@ def main():
     if args.long_doc_mode == "infmem":
         if args.snippet_max_tokens is None or args.snippet_max_tokens <= 0:
             parser.error("--snippet-max-tokens must be positive when --long-doc-mode=infmem")
+        if args.infmem_position == "visit" and args.toolset != "custom":
+            parser.error("--infmem-position=visit requires --toolset=custom")
         if not args.infmem_model:
             parser.error("--infmem-model is required when --long-doc-mode=infmem")
 
@@ -306,17 +347,34 @@ def main():
         k=args.k,
         long_doc_mode=args.long_doc_mode,
         infmem_summarizer=infmem_summarizer,
+        infmem_position=args.infmem_position,
     )
-    visit_tool_handler = VisitToolHandler(searcher=searcher) if include_visit else None
+    visit_tool_handler = (
+        VisitToolHandler(
+            searcher=searcher,
+            snippet_max_tokens=args.snippet_max_tokens,
+            long_doc_mode=args.long_doc_mode,
+            infmem_summarizer=infmem_summarizer,
+            infmem_position=args.infmem_position,
+        )
+        if include_visit
+        else None
+    )
     tool_names = ["search"]
     if include_visit:
         tool_names.append("visit")
 
+    if args.long_doc_mode == "infmem" and args.infmem_position == "memory_control":
+        context_controller = InfMemMemoryControl(infmem_summarizer=infmem_summarizer)
+    else:
+        context_controller = StandardConversationController()
+
     print(
         f"Tongyi search tool started with {searcher.search_type} search "
-        f"(snippet_max_tokens={args.snippet_max_tokens}, k={args.k}, long_doc_mode={args.long_doc_mode}, toolset={args.toolset})"
+        f"(snippet_max_tokens={args.snippet_max_tokens}, k={args.k}, long_doc_mode={args.long_doc_mode}, infmem_position={args.infmem_position}, toolset={args.toolset})"
     )
     print(f"Registered tools: {', '.join(tool_names)}")
+    print(f"Context controller: {context_controller.name}")
     if args.long_doc_mode == "infmem":
         print(
             "InfMem configuration: "
@@ -325,7 +383,8 @@ def main():
             f"timeout={args.infmem_timeout_seconds}s, "
             f"memory_budget={args.snippet_max_tokens}, "
             f"early_stop=1, "
-            f"max_recurrent_steps={args.infmem_max_recurrent_steps}"
+            f"max_recurrent_steps={args.infmem_max_recurrent_steps}, "
+            f"position={args.infmem_position}"
         )
 
     llm_cfg = {
@@ -345,6 +404,9 @@ def main():
         function_list=tool_names,
         search_tool_handler=search_tool_handler,
         visit_tool_handler=visit_tool_handler,
+        context_controller=context_controller,
+        long_doc_mode=args.long_doc_mode,
+        infmem_position=args.infmem_position,
     )
     
     query_str = args.query.strip()
